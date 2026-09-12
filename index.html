@@ -8,7 +8,8 @@
 <!-- Маркер для бота: services/tunnel.py принимает адрес кнопки, только если
      страница отвечает 200 и либо весит больше 5 КБ (сам мини-ап), либо несёт
      этот маркер (вход). Не переименовывать. -->
-<meta name="myllm-entry" content="2026-09-12">
+<meta name="myllm-entry" content="2026-09-13">
+<!-- connect-src ограничен зоной дверей: при смене зоны Tailscale править и здесь. -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src https://*.tail3eed13.ts.net; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <title>MyLLM</title>
 <style>
@@ -25,7 +26,9 @@
     padding: 24px calc(20px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));
     transition: opacity .25s ease;
   }
-  body.leaving { opacity: 0; }
+  /* Не до нуля: если переход не удался (iOS оставляет страницу на экране),
+     статус должен остаться читаемым, пока страховка не вернёт кнопки. */
+  body.leaving { opacity: .35; }
   .hall { width: 100%; max-width: 360px; text-align: center; }
   .mark {
     font-size: 30px; font-weight: 700; letter-spacing: -0.03em; line-height: 1; margin-bottom: 14px;
@@ -84,8 +87,8 @@
   <p class="status" id="status" aria-live="polite">Подключаюсь…</p>
   <ul class="doors" id="doors" aria-label="Серверы"></ul>
   <section class="fail" id="fail" hidden>
-    <h2 class="lead">Не удалось подключиться</h2>
-    <p>Ни один сервер не ответил из вашей сети. Обычно помогает VPN: включите его и нажмите «Повторить».</p>
+    <h2 class="lead" id="fail-lead">Не удалось подключиться</h2>
+    <p id="fail-text">Ни один сервер не ответил из вашей сети. Обычно помогает VPN: включите его и нажмите «Повторить».</p>
     <button type="button" class="btn" id="retry">Повторить</button>
     <p class="direct">Открыть без проверки: <span id="direct"></span></p>
     <p class="note">Бот в чате работает и без приложения.</p>
@@ -94,19 +97,19 @@
 <script>
 (function () {
   'use strict';
-  // Двери мини-аппа — те же, что в /etc/miniapp-doors.conf на апельсинке.
-  // Порядок — только подсказка на первый раз; дальше страница помнит, какая
-  // дверь открылась у этого человека, и предпочитает её: в браузере той двери
-  // лежат его чаты, черновики и тема.
+  // Двери мини-аппа — те же, что в /etc/miniapp-doors.conf на апельсинке
+  // (канарейка и miniapp-entry.sh сверяют список с этой страницей). Первая —
+  // основная: на неё идут все, у кого нет привычной двери, и там лежат
+  // данные людей, открывавших приложение раньше.
   var DOORS = [
     { name: 'zefir',  url: 'https://zefir.tail3eed13.ts.net' },
     { name: 'granat', url: 'https://granat.tail3eed13.ts.net' }
   ];
   var PROBE_TIMEOUT = 12000; // мс на ответ одной двери: первое соединение с Funnel замерено в 5-9 с,
                              // на мобильной сети будет дольше — лучше подождать, чем зря показать «не удалось»
-  var PREF_GRACE = 1500;     // мс ждать привычную дверь после того, как ответила другая
   var SLOW_HINT = 3000;      // мс до подсказки «сеть отвечает медленно»
   var WATCHDOG = 16000;      // мс до экрана «не удалось», что бы ни зависло
+  var LEAVE_WATCHDOG = 20000; // мс после перехода: если мы всё ещё здесь — переход не удался
   var STORE_KEY = 'myllm_door';
 
   // Всё, что Telegram положил в адрес (tgWebAppData и прочее), уезжает на
@@ -181,8 +184,8 @@
       );
   }
 
-  // Первый успешный из списка; отказ — когда отказали все (без Promise.any:
-  // старые WebView его не знают).
+  // Первый успешный из списка; отказ со списком ошибок — когда отказали все
+  // (без Promise.any: старые WebView его не знают).
   function anyOf(promises) {
     return new Promise(function (resolve, reject) {
       var left = promises.length, errors = [];
@@ -193,37 +196,45 @@
     });
   }
 
+  // Привычная дверь — та, что открылась в прошлый раз; на первый раз —
+  // основная. Ждём ЕЁ исход (не дольше PROBE_TIMEOUT), даже если другая
+  // ответила раньше: в браузере той двери лежат черновики, тема и сессия
+  // этого человека, и все ходят в одну дверь, пока она открыта. Только если
+  // она закрыта — первая из остальных, что ответила.
   function pick() {
-    var pref = load(STORE_KEY);
+    var pref = load(STORE_KEY) || DOORS[0].name;
     var probes = DOORS.map(probe);
-    return anyOf(probes).then(function (first) {
-      var i = -1;
-      DOORS.forEach(function (d, k) { if (d.name === pref) i = k; });
-      if (i < 0 || first.name === pref) return first;
-      // Ответила не привычная дверь. Даём привычной ещё чуть-чуть — ради
-      // сохранённых у неё чатов, — но не ждём её вечно.
-      return new Promise(function (resolve) {
-        var done = false;
-        var t = setTimeout(function () { if (!done) { done = true; resolve(first); } }, PREF_GRACE);
-        probes[i].then(
-          function (d) { if (!done) { done = true; clearTimeout(t); resolve(d); } },
-          function () { if (!done) { done = true; clearTimeout(t); resolve(first); } }
-        );
-      });
-    });
+    var i = 0;
+    DOORS.forEach(function (d, k) { if (d.name === pref) i = k; });
+    return probes[i].then(function (d) { return d; }, function () { return anyOf(probes); });
   }
 
   // replace, не href: иначе кнопка «назад» вернула бы сюда, а отсюда снова
   // туда — петля, из которой приложение не закрыть.
+  var leaveTimer = null;
   function go(d) {
     save(STORE_KEY, d.name);
     setStatus('Открываю ' + d.name + '…');
     document.body.classList.add('leaving');
+    clearTimeout(leaveTimer);
+    // Страховка: проба и переход — разные соединения. Если переход не удался
+    // (iOS оставляет эту страницу на экране), вернуть человеку кнопки.
+    leaveTimer = setTimeout(function () {
+      document.body.classList.remove('leaving');
+      showFail([], 'Не получилось открыть ' + d.name);
+    }, LEAVE_WATCHDOG);
     location.replace(d.url + '/' + search + hash);
   }
 
-  function showFail() {
+  function showFail(errs, lead) {
     setStatus('');
+    // Сервер ответил, но не готов (503 и подобное) — это не сеть, VPN не поможет.
+    var server = false;
+    (errs || []).forEach(function (e) { if (e && e.http) server = true; });
+    $('fail-lead').textContent = lead || (server ? 'Сервер не готов' : 'Не удалось подключиться');
+    $('fail-text').textContent = server
+      ? 'Серверы отвечают, но приложение сейчас не готово. Подождите минуту и нажмите «Повторить».'
+      : 'Ни один сервер не ответил из вашей сети. Обычно помогает VPN: включите его и нажмите «Повторить».';
     var box = $('direct');
     box.textContent = '';
     DOORS.forEach(function (d, i) {
@@ -239,14 +250,19 @@
   var slowTimer = null, watchdog = null;
   function run() {
     $('fail').hidden = true;
+    document.body.classList.remove('leaving');
+    clearTimeout(leaveTimer);
     setStatus('Подключаюсь…');
     renderDoors();
     clearTimeout(slowTimer); clearTimeout(watchdog);
     var finished = false;
     function finish(fn) { if (finished) return; finished = true; clearTimeout(slowTimer); clearTimeout(watchdog); fn(); }
     slowTimer = setTimeout(function () { setStatus('Сеть отвечает медленно — ещё немного…'); }, SLOW_HINT);
-    watchdog = setTimeout(function () { finish(showFail); }, WATCHDOG);
-    pick().then(function (d) { finish(function () { go(d); }); }, function () { finish(showFail); });
+    watchdog = setTimeout(function () { finish(function () { showFail([]); }); }, WATCHDOG);
+    pick().then(
+      function (d) { finish(function () { go(d); }); },
+      function (errs) { finish(function () { showFail(errs); }); }
+    );
   }
 
   applyTheme();
