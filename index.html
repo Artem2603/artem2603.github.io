@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex">
+<!-- Маркер для бота: services/tunnel.py принимает адрес кнопки, только если
+     страница отвечает 200 и либо весит больше 5 КБ (сам мини-ап), либо несёт
+     этот маркер (вход). Не переименовывать. -->
+<meta name="myllm-entry" content="2026-09-12">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src https://*.tail3eed13.ts.net; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>MyLLM</title>
+<style>
+  :root {
+    --bg: #1c1c1e; --bg2: #2c2c2e; --text: #ffffff; --hint: #8e8e93;
+    --accent: #0a84ff; --accent-text: #ffffff; --danger: #ff453a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", Roboto, "Segoe UI", system-ui, sans-serif;
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px calc(20px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));
+    transition: opacity .25s ease;
+  }
+  body.leaving { opacity: 0; }
+  .hall { width: 100%; max-width: 360px; text-align: center; }
+  .mark {
+    font-size: 30px; font-weight: 700; letter-spacing: -0.03em; line-height: 1; margin-bottom: 14px;
+  }
+  .mark b { color: var(--accent); font-weight: inherit; }
+  .status { color: var(--hint); font-size: 15px; min-height: 1.4em; }
+  .lead { font-size: 19px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 8px; }
+  .fail p { color: var(--hint); font-size: 15px; }
+
+  /* Планка серверов: по одной «двери» на сервер. Дверь стучит, пока ждём,
+     распахивается, когда сервер ответил, гаснет, если нет. */
+  .doors { list-style: none; display: flex; justify-content: center; gap: 28px; margin: 26px 0 22px; }
+  .door { display: flex; flex-direction: column; align-items: center; gap: 7px; min-width: 64px; color: var(--hint); }
+  .glyph {
+    display: block; width: 18px; height: 30px; border: 2px solid currentColor; border-radius: 4px 4px 2px 2px;
+    position: relative; transform-origin: left center;
+    transition: transform .4s cubic-bezier(.2,.8,.2,1), color .2s ease, opacity .2s ease;
+    animation: knock 1.2s ease-in-out infinite;
+  }
+  .glyph::after {
+    content: ""; position: absolute; right: 3px; top: 50%; width: 3px; height: 3px; margin-top: -1px;
+    border-radius: 50%; background: currentColor;
+  }
+  .door.open { color: var(--accent); }
+  .door.open .glyph { animation: none; transform: perspective(70px) rotateY(-52deg); }
+  .door.fail { color: var(--danger); }
+  .door.fail .glyph { animation: none; opacity: .5; }
+  .name { font-size: 13px; font-weight: 600; letter-spacing: .01em; color: var(--text); }
+  .door.fail .name { color: var(--hint); }
+  .st { font-size: 12px; }
+  @keyframes knock { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+
+  .btn {
+    display: block; width: 100%; padding: 14px 16px; margin: 6px 0 16px;
+    border: 0; border-radius: 12px; background: var(--accent); color: var(--accent-text);
+    font: inherit; font-size: 16px; font-weight: 600; cursor: pointer;
+  }
+  .btn:active { opacity: .85; }
+  .direct { font-size: 14px; }
+  .link {
+    background: none; border: 0; padding: 4px 2px; font: inherit; font-size: 14px;
+    color: var(--accent); text-decoration: underline; text-underline-offset: 3px; cursor: pointer;
+  }
+  .note { margin-top: 14px; font-size: 13px; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
+  [hidden] { display: none !important; }
+  @media (prefers-reduced-motion: reduce) {
+    .glyph, body { transition: none; animation: none; }
+    .glyph { opacity: .8; }
+  }
+</style>
+</head>
+<body>
+<main class="hall">
+  <h1 class="mark">My<b>LLM</b></h1>
+  <p class="status" id="status" aria-live="polite">Подключаюсь…</p>
+  <ul class="doors" id="doors" aria-label="Серверы"></ul>
+  <section class="fail" id="fail" hidden>
+    <h2 class="lead">Не удалось подключиться</h2>
+    <p>Ни один сервер не ответил из вашей сети. Обычно помогает VPN: включите его и нажмите «Повторить».</p>
+    <button type="button" class="btn" id="retry">Повторить</button>
+    <p class="direct">Открыть без проверки: <span id="direct"></span></p>
+    <p class="note">Бот в чате работает и без приложения.</p>
+  </section>
+</main>
+<script>
+(function () {
+  'use strict';
+  // Двери мини-аппа — те же, что в /etc/miniapp-doors.conf на апельсинке.
+  // Порядок — только подсказка на первый раз; дальше страница помнит, какая
+  // дверь открылась у этого человека, и предпочитает её: в браузере той двери
+  // лежат его чаты, черновики и тема.
+  var DOORS = [
+    { name: 'zefir',  url: 'https://zefir.tail3eed13.ts.net' },
+    { name: 'granat', url: 'https://granat.tail3eed13.ts.net' }
+  ];
+  var PROBE_TIMEOUT = 8000;  // мс на ответ одной двери (первое соединение с Funnel бывает 5-9 с)
+  var PREF_GRACE = 1500;     // мс ждать привычную дверь после того, как ответила другая
+  var SLOW_HINT = 3000;      // мс до подсказки «сеть отвечает медленно»
+  var WATCHDOG = 12000;      // мс до экрана «не удалось», что бы ни зависло
+  var STORE_KEY = 'myllm_door';
+
+  // Всё, что Telegram положил в адрес (tgWebAppData и прочее), уезжает на
+  // дверь как есть. Фрагмент на сервер не уходит — ни сюда, ни на GitHub.
+  var search = location.search || '';
+  var hash = location.hash || '';
+
+  function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+  function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+  function $(id) { return document.getElementById(id); }
+  function setStatus(t) { $('status').textContent = t; }
+
+  // Цвета темы Telegram приходят в адресе; применяем только похожие на цвет.
+  function applyTheme() {
+    try {
+      var raw = new URLSearchParams(hash.replace(/^#/, '')).get('tgWebAppThemeParams');
+      if (!raw) return;
+      var t = JSON.parse(raw);
+      var map = {
+        bg_color: '--bg', secondary_bg_color: '--bg2', text_color: '--text', hint_color: '--hint',
+        button_color: '--accent', button_text_color: '--accent-text', destructive_text_color: '--danger'
+      };
+      var root = document.documentElement.style;
+      Object.keys(map).forEach(function (k) {
+        var v = t[k];
+        if (typeof v === 'string' && /^#[0-9a-fA-F]{6}$/.test(v)) root.setProperty(map[k], v);
+      });
+    } catch (e) {}
+  }
+
+  var tiles = {};
+  function renderDoors() {
+    var ul = $('doors');
+    ul.textContent = '';
+    tiles = {};
+    DOORS.forEach(function (d) {
+      var li = document.createElement('li'); li.className = 'door';
+      var glyph = document.createElement('span'); glyph.className = 'glyph'; glyph.setAttribute('aria-hidden', 'true');
+      var name = document.createElement('span'); name.className = 'name'; name.textContent = d.name;
+      var st = document.createElement('span'); st.className = 'st'; st.textContent = 'жду…';
+      li.appendChild(glyph); li.appendChild(name); li.appendChild(st);
+      ul.appendChild(li);
+      tiles[d.name] = { li: li, st: st };
+    });
+  }
+  function mark(d, state, text) {
+    var t = tiles[d.name];
+    if (!t) return;
+    t.li.className = 'door ' + state;
+    t.st.textContent = text;
+  }
+  function describe(err) {
+    if (err && err.name === 'AbortError') return 'таймаут';
+    if (err && err.http) return 'HTTP ' + err.http;
+    return 'нет ответа';
+  }
+
+  // Одна дверь: 200 на /readyz — открыта. Не 2xx, переадресация, обрыв или
+  // молчание дольше PROBE_TIMEOUT — закрыта. Дверь отдаёт CORS для этого
+  // origin (MYLLM_EXTRA_CORS_ORIGINS в .env бота), иначе ответ не прочитать.
+  function probe(d) {
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, PROBE_TIMEOUT);
+    return fetch(d.url + '/readyz', { cache: 'no-store', credentials: 'omit', redirect: 'error', signal: ac.signal })
+      .then(function (r) {
+        if (!r.ok) { var e = new Error('HTTP ' + r.status); e.http = r.status; throw e; }
+        return d;
+      })
+      .then(
+        function (ok) { clearTimeout(timer); mark(d, 'open', 'открыта'); return ok; },
+        function (err) { clearTimeout(timer); mark(d, 'fail', describe(err)); throw err; }
+      );
+  }
+
+  // Первый успешный из списка; отказ — когда отказали все (без Promise.any:
+  // старые WebView его не знают).
+  function anyOf(promises) {
+    return new Promise(function (resolve, reject) {
+      var left = promises.length, errors = [];
+      if (!left) { reject(errors); return; }
+      promises.forEach(function (p, i) {
+        p.then(resolve, function (e) { errors[i] = e; if (--left === 0) reject(errors); });
+      });
+    });
+  }
+
+  function pick() {
+    var pref = load(STORE_KEY);
+    var probes = DOORS.map(probe);
+    return anyOf(probes).then(function (first) {
+      var i = -1;
+      DOORS.forEach(function (d, k) { if (d.name === pref) i = k; });
+      if (i < 0 || first.name === pref) return first;
+      // Ответила не привычная дверь. Даём привычной ещё чуть-чуть — ради
+      // сохранённых у неё чатов, — но не ждём её вечно.
+      return new Promise(function (resolve) {
+        var done = false;
+        var t = setTimeout(function () { if (!done) { done = true; resolve(first); } }, PREF_GRACE);
+        probes[i].then(
+          function (d) { if (!done) { done = true; clearTimeout(t); resolve(d); } },
+          function () { if (!done) { done = true; clearTimeout(t); resolve(first); } }
+        );
+      });
+    });
+  }
+
+  // replace, не href: иначе кнопка «назад» вернула бы сюда, а отсюда снова
+  // туда — петля, из которой приложение не закрыть.
+  function go(d) {
+    save(STORE_KEY, d.name);
+    setStatus('Открываю ' + d.name + '…');
+    document.body.classList.add('leaving');
+    location.replace(d.url + '/' + search + hash);
+  }
+
+  function showFail() {
+    setStatus('');
+    var box = $('direct');
+    box.textContent = '';
+    DOORS.forEach(function (d, i) {
+      if (i) box.appendChild(document.createTextNode(' · '));
+      var b = document.createElement('button');
+      b.type = 'button'; b.className = 'link'; b.textContent = d.name;
+      b.addEventListener('click', function () { go(d); });
+      box.appendChild(b);
+    });
+    $('fail').hidden = false;
+  }
+
+  var slowTimer = null, watchdog = null;
+  function run() {
+    $('fail').hidden = true;
+    setStatus('Подключаюсь…');
+    renderDoors();
+    clearTimeout(slowTimer); clearTimeout(watchdog);
+    var finished = false;
+    function finish(fn) { if (finished) return; finished = true; clearTimeout(slowTimer); clearTimeout(watchdog); fn(); }
+    slowTimer = setTimeout(function () { setStatus('Сеть отвечает медленно — ещё немного…'); }, SLOW_HINT);
+    watchdog = setTimeout(function () { finish(showFail); }, WATCHDOG);
+    pick().then(function (d) { finish(function () { go(d); }); }, function () { finish(showFail); });
+  }
+
+  applyTheme();
+  $('retry').addEventListener('click', run);
+  run();
+})();
+</script>
+</body>
+</html>
