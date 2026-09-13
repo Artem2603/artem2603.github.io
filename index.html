@@ -9,8 +9,6 @@
      страница отвечает 200 и либо весит больше 5 КБ (сам мини-ап), либо несёт
      этот маркер (вход). Не переименовывать. -->
 <meta name="myllm-entry" content="2026-09-13">
-<!-- connect-src ограничен зоной дверей: при смене зоны Tailscale править и здесь. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src https://*.tail3eed13.ts.net; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
 <title>MyLLM</title>
 <style>
   :root {
@@ -24,11 +22,7 @@
     font: 16px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", Roboto, "Segoe UI", system-ui, sans-serif;
     display: flex; align-items: center; justify-content: center;
     padding: 24px calc(20px + env(safe-area-inset-right)) calc(24px + env(safe-area-inset-bottom)) calc(20px + env(safe-area-inset-left));
-    transition: opacity .25s ease;
   }
-  /* Не до нуля: если переход не удался (iOS оставляет страницу на экране),
-     статус должен остаться читаемым, пока страховка не вернёт кнопки. */
-  body.leaving { opacity: .35; }
   .hall { width: 100%; max-width: 360px; text-align: center; }
   .mark {
     font-size: 30px; font-weight: 700; letter-spacing: -0.03em; line-height: 1; margin-bottom: 14px;
@@ -76,8 +70,7 @@
   :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 6px; }
   [hidden] { display: none !important; }
   @media (prefers-reduced-motion: reduce) {
-    .glyph, body { transition: none; animation: none; }
-    .glyph { opacity: .8; }
+    .glyph { transition: none; animation: none; opacity: .8; }
   }
 </style>
 </head>
@@ -99,28 +92,38 @@
   'use strict';
   // Двери мини-аппа — те же, что в /etc/miniapp-doors.conf на апельсинке
   // (канарейка и miniapp-entry.sh сверяют список с этой страницей). Первая —
-  // основная: на неё идут все, у кого нет привычной двери, и там лежат
-  // данные людей, открывавших приложение раньше.
+  // основная: на неё идут все, у кого нет привычной двери.
   var DOORS = [
     { name: 'zefir',  url: 'https://zefir.tail3eed13.ts.net' },
     { name: 'granat', url: 'https://granat.tail3eed13.ts.net' }
   ];
   var PROBE_TIMEOUT = 12000; // мс на ответ одной двери: первое соединение с Funnel замерено в 5-9 с,
                              // на мобильной сети будет дольше — лучше подождать, чем зря показать «не удалось»
+  var ENTER_TIMEOUT = 40000; // мс на скачивание самого приложения с двери (около 700 КБ)
+  var STYLE_WAIT = 6000;     // мс ждать стили приложения до запуска его скриптов
   var SLOW_HINT = 3000;      // мс до подсказки «сеть отвечает медленно»
-  var WATCHDOG = 16000;      // мс до экрана «не удалось», что бы ни зависло
-  var LEAVE_WATCHDOG = 20000; // мс после перехода: если мы всё ещё здесь — переход не удался
+  var WATCHDOG = 16000;      // мс до экрана «не удалось», что бы ни зависло на этапе проверки
   var STORE_KEY = 'myllm_door';
 
-  // Всё, что Telegram положил в адрес (tgWebAppData и прочее), уезжает на
-  // дверь как есть. Фрагмент на сервер не уходит — ни сюда, ни на GitHub.
-  var search = location.search || '';
+  // Как это работает. Страница НЕ уходит на дверь: она скачивает приложение с
+  // открытой двери и запускает его прямо здесь, а <base href> направляет все
+  // его запросы и ассеты на дверь. Адрес в WebView остаётся адресом входа:
+  // Telegram ничего не перехватывает (на Android переход на другой домен из
+  // Mini App открывался ещё и во встроенном браузере — без данных входа),
+  // фрагмент #tgWebAppData остаётся на месте, и методы Telegram.WebApp
+  // работают с origin входа даже при включённой защите.
+  //
+  // Почему не document.write: Chrome на медленной сети (2G по его оценке)
+  // блокирует внешние скрипты, вставленные через document.write. Поэтому
+  // страницу приложения разбирает DOMParser, DOM подменяется целиком, а его
+  // скрипты подключаются заново по одному, в исходном порядке.
   var hash = location.hash || '';
 
   function load(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
   function save(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
   function $(id) { return document.getElementById(id); }
-  function setStatus(t) { $('status').textContent = t; }
+  var entered = false;
+  function setStatus(t) { if (entered) return; var el = $('status'); if (el) el.textContent = t; }
 
   // Цвета темы Telegram приходят в адресе; применяем только похожие на цвет.
   function applyTheme() {
@@ -140,11 +143,11 @@
     } catch (e) {}
   }
 
-  var tiles = {};
+  var tiles = {}, doorState = {};
   function renderDoors() {
     var ul = $('doors');
     ul.textContent = '';
-    tiles = {};
+    tiles = {}; doorState = {};
     DOORS.forEach(function (d) {
       var li = document.createElement('li'); li.className = 'door';
       var glyph = document.createElement('span'); glyph.className = 'glyph'; glyph.setAttribute('aria-hidden', 'true');
@@ -153,9 +156,12 @@
       li.appendChild(glyph); li.appendChild(name); li.appendChild(st);
       ul.appendChild(li);
       tiles[d.name] = { li: li, st: st };
+      doorState[d.name] = 'wait';
     });
   }
   function mark(d, state, text) {
+    if (entered) return;
+    doorState[d.name] = state;
     var t = tiles[d.name];
     if (!t) return;
     t.li.className = 'door ' + state;
@@ -164,6 +170,7 @@
   function describe(err) {
     if (err && err.name === 'AbortError') return 'таймаут';
     if (err && err.http) return 'HTTP ' + err.http;
+    if (err && err.notApp) return 'не приложение';
     return 'нет ответа';
   }
 
@@ -198,8 +205,7 @@
 
   // Привычная дверь — та, что открылась в прошлый раз; на первый раз —
   // основная. Ждём ЕЁ исход (не дольше PROBE_TIMEOUT), даже если другая
-  // ответила раньше: в браузере той двери лежат черновики, тема и сессия
-  // этого человека, и все ходят в одну дверь, пока она открыта. Только если
+  // ответила раньше: все ходят в одну дверь, пока она открыта. Только если
   // она закрыта — первая из остальных, что ответила.
   function pick() {
     var pref = load(STORE_KEY) || DOORS[0].name;
@@ -209,28 +215,115 @@
     return probes[i].then(function (d) { return d; }, function () { return anyOf(probes); });
   }
 
-  // replace, не href: иначе кнопка «назад» вернула бы сюда, а отсюда снова
-  // туда — петля, из которой приложение не закрыть.
-  var leaveTimer = null;
-  function go(d) {
-    save(STORE_KEY, d.name);
-    setStatus('Открываю ' + d.name + '…');
-    document.body.classList.add('leaving');
-    clearTimeout(leaveTimer);
-    // Страховка: проба и переход — разные соединения. Если переход не удался
-    // (iOS оставляет эту страницу на экране), вернуть человеку кнопки.
-    leaveTimer = setTimeout(function () {
-      document.body.classList.remove('leaving');
-      showFail([], 'Не получилось открыть ' + d.name);
-    }, LEAVE_WATCHDOG);
-    location.replace(d.url + '/' + search + hash);
+  // Скачать само приложение с двери. Проверяем, что это оно (а не страница
+  // ошибки Funnel с кодом 200): полноценный html с подключённым SDK Telegram.
+  function fetchApp(d) {
+    var ac = new AbortController();
+    var timer = setTimeout(function () { ac.abort(); }, ENTER_TIMEOUT);
+    return fetch(d.url + '/', { credentials: 'omit', redirect: 'error', signal: ac.signal })
+      .then(function (r) {
+        if (!r.ok) { var e = new Error('HTTP ' + r.status); e.http = r.status; throw e; }
+        return r.text();
+      })
+      .then(
+        function (html) {
+          clearTimeout(timer);
+          if (!/<html[\s>]/i.test(html) || html.indexOf('telegram-web-app.js') < 0) {
+            var e2 = new Error('not-app'); e2.notApp = true; throw e2;
+          }
+          return html;
+        },
+        function (err) { clearTimeout(timer); throw err; }
+      );
+  }
+
+  var slowTimer = null, watchdog = null;
+  function stopTimers() { clearTimeout(slowTimer); clearTimeout(watchdog); }
+
+  // Ждём стили приложения (как парсер ждёт их перед скриптами), но не вечно.
+  function waitStyles(links) {
+    return new Promise(function (resolve) {
+      var left = links.length, done = false;
+      function one() { if (!done && --left <= 0) { done = true; resolve(); } }
+      if (!left) { resolve(); return; }
+      links.forEach(function (l) {
+        if (l.sheet) { one(); return; }
+        l.addEventListener('load', one); l.addEventListener('error', one);
+      });
+      setTimeout(function () { if (!done) { done = true; resolve(); } }, STYLE_WAIT);
+    });
+  }
+
+  // Скрипты приложения по одному, в исходном порядке: внешний — ждём загрузки,
+  // встроенный — выполняется сразу при вставке. Атрибуты переносим как есть.
+  function runScripts(list, i) {
+    if (i >= list.length) return;
+    var s = list[i];
+    var n = document.createElement('script');
+    Array.prototype.slice.call(s.attributes).forEach(function (a) { n.setAttribute(a.name, a.value); });
+    if (s.hasAttribute('src')) {
+      n.async = false;
+      n.onload = n.onerror = function () { runScripts(list, i + 1); };
+      document.head.appendChild(n);
+    } else {
+      n.textContent = s.textContent;
+      document.head.appendChild(n);
+      runScripts(list, i + 1);
+    }
+  }
+
+  // Запуск приложения здесь же: тот же Window (мост Telegram, location с
+  // фрагментом, localStorage origin'а входа), другой DOM.
+  function enter(d) {
+    mark(d, 'open', 'загружаю…');
+    setStatus('Загружаю приложение с ' + d.name + '…');
+    return fetchApp(d).then(function (html) {
+      save(STORE_KEY, d.name);
+      var doc = new DOMParser().parseFromString(html, 'text/html');
+      var base = doc.createElement('base');
+      base.setAttribute('href', d.url + '/');
+      doc.head.insertBefore(base, doc.head.firstChild);
+      // Скрипты вынимаем из разобранного документа: вставленные готовым DOM
+      // они не выполняются, а нам нужен исходный порядок.
+      var scripts = Array.prototype.slice.call(doc.querySelectorAll('script'));
+      scripts.forEach(function (s) { s.parentNode.removeChild(s); });
+      // Внешние скрипты скачиваем заранее, параллельно; выполним по порядку.
+      scripts.forEach(function (s) {
+        if (!s.hasAttribute('src')) return;
+        var pre = doc.createElement('link');
+        pre.setAttribute('rel', 'preload'); pre.setAttribute('as', 'script');
+        pre.setAttribute('href', s.getAttribute('src'));
+        doc.head.appendChild(pre);
+      });
+      entered = true;
+      stopTimers();
+      var html2 = document.adoptNode(doc.documentElement);
+      document.replaceChild(html2, document.documentElement);
+      var links = Array.prototype.slice.call(document.querySelectorAll('link[rel="stylesheet"]'));
+      return waitStyles(links).then(function () { runScripts(scripts, 0); });
+    });
+  }
+
+  // По очереди: привычная дверь, потом остальные открытые, потом непроверенные.
+  // Закрытые (сбой пробы) не трогаем — там нечего качать.
+  function enterAny(list, i, errs) {
+    if (i >= list.length) return Promise.reject(errs);
+    var d = list[i];
+    if (doorState[d.name] === 'fail') return enterAny(list, i + 1, errs);
+    return enter(d).catch(function (e) {
+      if (entered) throw e;  // DOM уже подменён — назад дороги нет
+      errs.push(e);
+      mark(d, 'fail', describe(e));
+      return enterAny(list, i + 1, errs);
+    });
   }
 
   function showFail(errs, lead) {
+    if (entered) return;
     setStatus('');
-    // Сервер ответил, но не готов (503 и подобное) — это не сеть, VPN не поможет.
+    // Сервер ответил, но не готов (503, не приложение) — это не сеть, VPN не поможет.
     var server = false;
-    (errs || []).forEach(function (e) { if (e && e.http) server = true; });
+    (errs || []).forEach(function (e) { if (e && (e.http || e.notApp)) server = true; });
     $('fail-lead').textContent = lead || (server ? 'Сервер не готов' : 'Не удалось подключиться');
     $('fail-text').textContent = server
       ? 'Серверы отвечают, но приложение сейчас не готово. Подождите минуту и нажмите «Повторить».'
@@ -241,26 +334,33 @@
       if (i) box.appendChild(document.createTextNode(' · '));
       var b = document.createElement('button');
       b.type = 'button'; b.className = 'link'; b.textContent = d.name;
-      b.addEventListener('click', function () { go(d); });
+      b.addEventListener('click', function () {
+        $('fail').hidden = true;
+        doorState[d.name] = 'wait';
+        enter(d).catch(function (e) { showFail([e], 'Не получилось открыть ' + d.name); });
+      });
       box.appendChild(b);
     });
     $('fail').hidden = false;
   }
 
-  var slowTimer = null, watchdog = null;
   function run() {
     $('fail').hidden = true;
-    document.body.classList.remove('leaving');
-    clearTimeout(leaveTimer);
     setStatus('Подключаюсь…');
     renderDoors();
-    clearTimeout(slowTimer); clearTimeout(watchdog);
+    stopTimers();
     var finished = false;
-    function finish(fn) { if (finished) return; finished = true; clearTimeout(slowTimer); clearTimeout(watchdog); fn(); }
+    function finish(fn) { if (finished) return; finished = true; stopTimers(); fn(); }
     slowTimer = setTimeout(function () { setStatus('Сеть отвечает медленно — ещё немного…'); }, SLOW_HINT);
     watchdog = setTimeout(function () { finish(function () { showFail([]); }); }, WATCHDOG);
     pick().then(
-      function (d) { finish(function () { go(d); }); },
+      function (d) {
+        finish(function () {
+          var order = [d].concat(DOORS.filter(function (x) { return x !== d && doorState[x.name] === 'open'; }))
+                         .concat(DOORS.filter(function (x) { return x !== d && doorState[x.name] === 'wait'; }));
+          enterAny(order, 0, []).catch(function (errs) { showFail(errs); });
+        });
+      },
       function (errs) { finish(function () { showFail(errs); }); }
     );
   }
